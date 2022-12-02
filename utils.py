@@ -68,6 +68,12 @@ class Head(nn.Module):
         x = nn.Dense(features=Config["NUM_LABELS"])(x)
         return x
 
+    def set_head(params):
+        weights = params['weights']
+        biases = params['biases']
+        z.set_weights([weights, biases])
+        
+
 class Model(nn.Module):
     '''Combines backbone and head model'''
     backbone: Sequential
@@ -80,12 +86,10 @@ class Model(nn.Module):
         x = self.head(x, train)
         return x
 
-
 class TrainState(train_state.TrainState):
     batch_stats: FrozenDict
     loss_fn: Callable = flax.struct.field(pytree_node=False)
     eval_fn: Callable = flax.struct.field(pytree_node=False)
-
 
 ############################################################
 
@@ -129,20 +133,16 @@ def load_datasets():
 
 ##################### LOADING PRETRAINED MODEL ##################
 
-def _get_backbone_and_params(model_arch: str):
+def _get_backbone_and_params():
     '''
     Get backbone and params
     1. Loads pretrained model (resnet18)
     2. Get model and param structure except last 2 layers
     3. Extract the corresponding subset of the variables dict
-    INPUT : model_arch
     RETURNS backbone , backbone_params
     '''
-    if model_arch == 'resnet18':
-        resnet_tmpl, params = pretrained_resnet(18)
-        model = resnet_tmpl()
-    else:
-        raise NotImplementedError
+    resnet_tmpl, params = pretrained_resnet(18)
+    model = resnet_tmpl()
         
     # get model & param structure for backbone
     start, end = 0, len(model.layers) - 2
@@ -151,7 +151,7 @@ def _get_backbone_and_params(model_arch: str):
     return backbone, backbone_params
 
 
-def get_model_and_variables(model_arch: str, head_init_key: int):
+def get_model_and_variables(head_init_key=0):
     '''
     Get model and variables 
     1. Initialise inputs(shape=(1,image_size,image_size,3))
@@ -161,13 +161,13 @@ def get_model_and_variables(model_arch: str, head_init_key: int):
     5. Create final model using backbone and head
     6. Combine params from backbone and head
     
-    INPUT model_arch, head_init_key
+    INPUT head_init_key
     RETURNS  model, variables 
     '''
     
     #backbone
     inputs = jnp.ones((1, Config['IMAGE_SIZE'],Config['IMAGE_SIZE'], 3), jnp.float32)
-    backbone, backbone_params = _get_backbone_and_params(model_arch)
+    backbone, backbone_params = _get_backbone_and_params()
     key = jax.random.PRNGKey(head_init_key)
     backbone_output = backbone.apply(backbone_params, inputs, mutable=False)
     
@@ -291,15 +291,116 @@ def train_step(state: TrainState, batch, labels, dropout_rng):
     )
     return new_state, metadata, new_dropout_rng
 
-
 def val_step(state: TrainState, batch, labels):
     variables = {'params': state.params, 'batch_stats': state.batch_stats}
     logits = state.apply_fn(variables, batch, train=False) # stack the model's forward pass with the logits function
     return state.eval_fn(logits, labels)
 
+parallel_val_step = jax.pmap(val_step, axis_name='batch', donate_argnums=(0,))
+
 def test_step(state: TrainState, batch):
     variables = {'params': state.params, 'batch_stats': state.batch_stats}
     logits = state.apply_fn(variables, batch, train=False) # stack the model's forward pass with the logits function
     return logits
+
+####################################################################
+
+
+##################### FINE TUNING HELPER FUNCTIONS ################
+
+# Training Loop
+
+def train(state, epochs, save_path):
+  
+  rng = jax.random.PRNGKey(0)
+  dropout_rng = jax.random.split(rng, jax.local_device_count()) 
+
+  train_acc = []
+  valid_acc = []
+
+  #for epoch_i in tqdm(range(epochs), desc=f"{epochs} epochs", position=0, leave=True):
+  for epoch_i in range(epochs):
+      print(epoch_i)
+      # Training set
+      train_loss, train_accuracy = [], []
+      iter_n = len(train_dataset)
+      
+      with tqdm(total=iter_n, desc=f"{iter_n} iterations", leave=False) as progress_bar:
+          for _batch in train_dataset:
+              batch=_batch[0]  # train_dataset is tuple containing (image,labels)
+              labels=_batch[1]
+
+              batch = jnp.array(batch, dtype=jnp.float32)
+              labels = jnp.array(labels, dtype=jnp.float32)
+              
+              batch, labels = shard(batch), shard(labels)
+            
+              # backprop and update param & batch statsp
+              
+              state, train_metadata, dropout_rng = parallel_train_step(state, batch, labels, dropout_rng)
+              train_metadata = unreplicate(train_metadata)
+              
+              # update train statistics
+              _train_loss, _train_top1_acc = map(float, [train_metadata['loss'], *train_metadata['accuracy']])
+              train_loss.append(_train_loss)
+              train_accuracy.append(_train_top1_acc)
+              progress_bar.update(1)
+              del(batch)
+              del(labels)
+              
+      avg_train_loss = sum(train_loss)/len(train_loss)
+      avg_train_acc = sum(train_accuracy)/len(train_accuracy)
+      train_acc.append(avg_train_acc)
+      print(f"[{epoch_i+1}/{epochs}] Train Loss: {avg_train_loss:.03} | Train Accuracy: {avg_train_acc:.03}")
+
+      # Saves the model's weights
+      checkpoints.save_checkpoint(ckpt_dir=save_path, target=state, step=epoch_i, overwrite=True)
+      
+      # Validation set
+      valid_accuracy = []
+      iter_n = len(test_dataset)
+      with tqdm(total=iter_n, desc=f"{iter_n} iterations", leave=False) as progress_bar:
+          for _batch in test_dataset:
+              batch = _batch[0]
+              labels = _batch[1]
+
+              batch = jnp.array(batch, dtype=jnp.float32)
+              labels = jnp.array(labels, dtype=jnp.float32)
+
+              batch, labels = shard(batch), shard(labels)
+              metric = parallel_val_step(state, batch, labels)[0]
+              valid_accuracy.append(metric)
+              progress_bar.update(1)
+              del(batch)
+              del(labels)
+
+      avg_valid_acc = sum(valid_accuracy)/len(valid_accuracy)
+      avg_valid_acc = np.array(avg_valid_acc)[0]
+      valid_acc.append(avg_valid_acc)
+      print(f"[{epoch_i+1}/{Config['N_EPOCHS']}] Valid Accuracy: {avg_valid_acc:.03}")
+  return train_acc, valid_acc
+
+def get_optimizer(optimizer_type, lr, weight_decay):
+    optimizer = None
+    if optimizer_type == 0:
+      optimizer = optax.rmsprop(
+          learning_rate=lr, 
+          decay=weight_decay, 
+          eps=1e-6
+        )
+    elif optimizer_type == 1:
+      optimizer = optax.adam(
+          learning_rate=lr,
+          b1=0.9, b2=0.999, 
+          eps=1e-6
+      )
+    elif optimizer_type == 2:
+      optimizer = optax.adamw(
+          learning_rate=lr,
+          b1=0.9, b2=0.999, 
+          eps=1e-6, weight_decay=weight_decay
+      )
+    
+    return optimizer
 
 ####################################################################
