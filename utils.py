@@ -296,12 +296,14 @@ def val_step(state: TrainState, batch, labels):
     logits = state.apply_fn(variables, batch, train=False) # stack the model's forward pass with the logits function
     return state.eval_fn(logits, labels)
 
-parallel_val_step = jax.pmap(val_step, axis_name='batch', donate_argnums=(0,))
-
 def test_step(state: TrainState, batch):
     variables = {'params': state.params, 'batch_stats': state.batch_stats}
     logits = state.apply_fn(variables, batch, train=False) # stack the model's forward pass with the logits function
     return logits
+
+parallel_train_step = jax.pmap(train_step, axis_name='batch', donate_argnums=(0,))
+parallel_val_step = jax.pmap(val_step, axis_name='batch', donate_argnums=(0,))
+parallel_test_step = jax.pmap(test_step, axis_name='batch', donate_argnums=(0,))
 
 ####################################################################
 
@@ -310,7 +312,7 @@ def test_step(state: TrainState, batch):
 
 # Training Loop
 
-def train(state, epochs, save_path):
+def train(state, epochs, train_dataset, test_dataset, save_path):
   
   rng = jax.random.PRNGKey(0)
   dropout_rng = jax.random.split(rng, jax.local_device_count()) 
@@ -354,7 +356,8 @@ def train(state, epochs, save_path):
       print(f"[{epoch_i+1}/{epochs}] Train Loss: {avg_train_loss:.03} | Train Accuracy: {avg_train_acc:.03}")
 
       # Saves the model's weights
-      checkpoints.save_checkpoint(ckpt_dir=save_path, target=state, step=epoch_i, overwrite=True)
+      if save_path:
+        checkpoints.save_checkpoint(ckpt_dir=save_path, target=state, step=epoch_i, overwrite=True)
       
       # Validation set
       valid_accuracy = []
