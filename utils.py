@@ -4,14 +4,20 @@ import matplotlib.pyplot as plt
 from torchvision.transforms import *
 
 
+##############################################  
+########## Graphing Helper Functions #########    
+############################################## 
+
 MODEL_TYPES = ['Ensemble', 'Uniform Soup', 'Weighted Soup', 
-            'Greedy Soup', 'Shephard Soup']
+            'Greedy Soup', 'Shepherd Soup']
 
 def plt_all_model_accs(val_accs):
     names = [f'Model {i+1}' for i in range(len(val_accs))]
     assert len(names) == len(val_accs)
     
     i = np.argmax(np.array(val_accs))
+    print(i)
+
     colors = ['blue'] * len(val_accs)
     colors[i] = 'green'
 
@@ -31,7 +37,7 @@ def plt_diff_model_accs(val_accs, model_type=''):
         names.extend(MODEL_TYPES[:3])
     elif model_type == 'Greedy Soup':
         names.extend(MODEL_TYPES[:4])
-    elif model_type == 'Shephard Soup':
+    elif model_type == 'Shepherd Soup':
         names.extend(MODEL_TYPES)
 
     assert len(names) == len(val_accs)
@@ -40,7 +46,7 @@ def plt_diff_model_accs(val_accs, model_type=''):
     
     plt.bar(names, np.array(val_accs), color=colors)
     plt.title("Validation Accuracy By Model")
-    plt.ylim([0.75, 0.85])
+    plt.ylim([0.80, 0.85])
     plt.xticks(rotation=30, ha='right')
     plt.show()
 
